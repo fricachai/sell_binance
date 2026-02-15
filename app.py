@@ -1,9 +1,12 @@
 # app.py
 # Binance USDT-M Perpetual (Futures) | 指定幣種「賣出/減碼」提醒（15m）
-# + Telegram Bot 推播（防洗版：狀態變更才送）
-# + Binance API 451 防呆：多端點備援 + 加 User-Agent + 先驗證合約存在 + 簡單重試
+# - 不依賴 exchangeInfo（避免 403 卡死）
+# - 端點備援 + 重試 + 友善錯誤
+# - 離線模式：可直接貼入 K 線 JSON 進行判定
+# - Telegram Bot 推播（防洗版：狀態變更才送）
 
 import time
+import json
 import requests
 import pandas as pd
 import numpy as np
@@ -14,7 +17,7 @@ import streamlit as st
 # -----------------------------
 FAPI_BASES = [
     "https://fapi.binance.com",
-    "https://fstream.binance.com",  # 官方別名，很多情況可繞過 451
+    "https://fstream.binance.com",
 ]
 
 HEADERS = {
@@ -25,51 +28,42 @@ HEADERS = {
     "Accept": "application/json,text/plain,*/*",
 }
 
-@st.cache_data(ttl=60 * 30)  # 30 分鐘更新一次（避免每次都打 exchangeInfo）
-def fetch_exchange_info():
+def try_get_json(url: str, params=None, retries=2):
     last_err = ""
-    for base in FAPI_BASES:
+    for _ in range(retries + 1):
         try:
-            r = requests.get(f"{base}/fapi/v1/exchangeInfo", headers=HEADERS, timeout=20)
+            r = requests.get(url, params=params, headers=HEADERS, timeout=20)
             r.raise_for_status()
-            return r.json()
+            return r.json(), ""
         except Exception as e:
-            last_err = f"{base} -> {e}"
+            last_err = str(e)
+            time.sleep(0.6)
             continue
-    raise RuntimeError(f"exchangeInfo 取得失敗：{last_err}")
+    return None, last_err
 
-def ensure_symbol_exists(symbol: str) -> tuple[bool, str]:
-    data = fetch_exchange_info()
-    syms = {s.get("symbol") for s in data.get("symbols", [])}
-    if symbol in syms:
-        return True, ""
-    return False, f"找不到 USDT-M 永續合約：{symbol}（可能只有 Spot、或已下架/改名）"
-
-def get_klines(symbol: str, interval="15m", limit=300, retries=2):
-    ok, msg = ensure_symbol_exists(symbol)
-    if not ok:
-        raise RuntimeError(msg)
-
+def get_klines_online(symbol: str, interval="15m", limit=300, retries=2):
+    """
+    不做 exchangeInfo：直接抓 klines
+    若 symbol 不存在，Binance 通常回 400/404，會被這裡顯示出來
+    """
     last_err = ""
     for base in FAPI_BASES:
-        for _ in range(retries + 1):
-            try:
-                r = requests.get(
-                    f"{base}/fapi/v1/klines",
-                    params={"symbol": symbol, "interval": interval, "limit": limit},
-                    headers=HEADERS,
-                    timeout=20,
-                )
-                r.raise_for_status()
-                return r.json()
-            except Exception as e:
-                last_err = f"{base} -> {e}"
-                time.sleep(0.6)
-                continue
+        data, err = try_get_json(
+            f"{base}/fapi/v1/klines",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            retries=retries,
+        )
+        if data is not None:
+            return data
+        last_err = f"{base} -> {err}"
 
     raise RuntimeError(
-        f"K線取得失敗（可能遭 451/風控/環境IP 擋）：{last_err}\n"
-        f"建議：若你在雲端（如 Streamlit Cloud），Binance 常擋該 IP 段；可改用本機跑或換出口網路。"
+        "K線取得失敗（多半是環境/IP 被 Binance 擋：403/451）\n"
+        f"最後錯誤：{last_err}\n\n"
+        "解法：\n"
+        "A) 改成本機跑（最穩）\n"
+        "B) 換網路出口（手機熱點/家用網路）\n"
+        "C) 使用本頁『離線模式』貼入 K 線 JSON 照樣判定"
     )
 
 def parse_klines(ks):
@@ -105,6 +99,9 @@ def ema(x, n):
     return pd.Series(x).ewm(span=n, adjust=False).mean().to_numpy()
 
 def rsi(close, length=14):
+ PARAMETERS = """
+        RSI (Wilder)
+    """
     c = pd.Series(close)
     delta = c.diff()
     gain = delta.clip(lower=0.0)
@@ -140,11 +137,7 @@ def tg_send_message(token: str, chat_id: str, text: str) -> tuple[bool, str]:
     try:
         r = requests.post(
             url,
-            data={
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": True,
-            },
+            data={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
             timeout=20,
         )
         if r.status_code != 200:
@@ -159,7 +152,6 @@ def format_alert(symbol: str, interval: str, status: str, reasons: list[str], sn
 
     extra = ""
     if snap:
-        # 只放關鍵數值，避免訊息過長
         extra = (
             f"\n時間: {snap.get('time')}"
             f"\nClose: {snap.get('close')}"
@@ -173,17 +165,12 @@ def format_alert(symbol: str, interval: str, status: str, reasons: list[str], sn
         if "trail_stop" in snap:
             extra += f"\nTrailStop: {snap.get('trail_stop'):.6f}"
 
-    msg = f"{status_txt}\n標的: {symbol} ({interval})\n原因:\n{reason_txt}{extra}"
-    return msg
+    return f"{status_txt}\n標的: {symbol} ({interval})\n原因:\n{reason_txt}{extra}"
 
 # -----------------------------
 # Exit Logic
 # -----------------------------
 def evaluate_exit(df, p):
-    """
-    用上一根已收K：idx = -2
-    回傳：status(OK/WARN/EXIT), reasons(list), snapshot(dict)
-    """
     close = df["close"].to_numpy()
     high = df["high"].to_numpy()
     low = df["low"].to_numpy()
@@ -198,11 +185,11 @@ def evaluate_exit(df, p):
 
     i = -2  # last CLOSED candle
 
-    need = [ma7, ma25, ma99, r, macd_line, sig_line, hist, atrv]
-    if len(close) < max(p["MA_LONG"], p["MA_SLOW"], p["MACD_SLOW"], p["ATR_LEN"]) + 5:
-        return "OK", ["資料不足：K線數量不夠（請提高 limit 或縮短 MA）"], {}
+    need_min = max(p["MA_LONG"], p["MA_SLOW"], p["MACD_SLOW"], p["ATR_LEN"]) + 5
+    if len(close) < need_min:
+        return "OK", [f"資料不足：K線數量不夠（至少 {need_min} 根；目前 {len(close)}）"], {}
 
-    if any(np.isnan(arr[i]) for arr in need):
+    if any(np.isnan(arr[i]) for arr in [ma7, ma25, ma99, r, macd_line, sig_line, hist, atrv]):
         return "OK", ["資料不足：指標尚未穩定（rolling/EMA 初期 NaN）"], {}
 
     gap = (ma7[i] - ma25[i]) / ma25[i]
@@ -211,34 +198,34 @@ def evaluate_exit(df, p):
     exit_reasons = []
     warn_reasons = []
 
-    # (強) 1) 收盤跌破 MA25
+    # 強：收盤跌破 MA25
     if close[i] < ma25[i]:
         exit_reasons.append("收盤跌破 MA25（趨勢失守）")
 
-    # (強) 2) MA7 下穿 MA25
+    # 強：MA7 下穿 MA25
     cross_down = (ma7[i - 1] >= ma25[i - 1]) and (ma7[i] < ma25[i])
     if cross_down:
         exit_reasons.append("MA7 下穿 MA25（短線轉弱）")
 
-    # (強) 3) MACD 下穿 + Histogram 連續走弱
+    # 強：MACD 下穿 + Histogram 連續走弱
     macd_cross_down = (macd_line[i - 1] >= sig_line[i - 1]) and (macd_line[i] < sig_line[i])
     hist_weak = (hist[i] < hist[i - 1]) and (hist[i - 1] < hist[i - 2])
     if macd_cross_down and hist_weak:
         exit_reasons.append("MACD 下穿訊號線且 Histogram 連續走弱（動能反轉）")
 
-    # (弱/警戒) RSI 過熱
+    # 警戒：RSI 過熱
     if r[i] >= p["RSI_WARN"]:
         warn_reasons.append(f"RSI 過熱（RSI={r[i]:.1f} ≥ {p['RSI_WARN']}）")
 
-    # (弱/警戒) 距 MA99 過遠（不追高）
+    # 警戒：距 MA99 過遠（不追高）
     if dist99 >= p["DIST99_WARN"]:
         warn_reasons.append(f"距 MA99 偏遠（{dist99*100:.2f}% ≥ {p['DIST99_WARN']*100:.2f}%）")
 
-    # (弱/警戒) MACD > 0 但 Histogram 走弱（你說的「0 軸上太久/動能衰退」）
+    # 警戒：MACD > 0 但 Histogram 走弱（動能衰退）
     if (macd_line[i] > 0) and hist_weak:
         warn_reasons.append("MACD > 0 但 Histogram 連續走弱（動能衰退）")
 
-    # (選用) ATR 移動停利/停損（用最近 N 根近似 entry 後區間）
+    # 選用：ATR 移動停利
     trail_info = None
     if p["USE_ATR_TRAIL"]:
         n = int(p["TRAIL_LOOKBACK_BARS"])
@@ -249,7 +236,6 @@ def evaluate_exit(df, p):
         if close[i] < trail_stop:
             exit_reasons.append(f"跌破 ATR 移動停利線（trail_stop={trail_stop:.6f}）")
 
-    # 狀態定義
     if exit_reasons:
         status = "EXIT"
         reasons = exit_reasons + (warn_reasons[:2] if warn_reasons else [])
@@ -286,10 +272,20 @@ st.set_page_config(page_title="Binance Futures Exit Notifier", layout="wide")
 st.title("Binance USDT-M 永續｜指定幣種「賣出/減碼」提醒（15m）")
 
 with st.sidebar:
+    st.header("資料來源")
+    mode = st.radio("模式", ["線上抓 Binance Futures", "離線：貼入 K 線 JSON"], index=0)
+
     st.header("監控設定")
     symbol = st.text_input("合約代號（例：BTCUSDT）", value="BTCUSDT").strip().upper()
     interval = st.selectbox("K線週期", ["15m", "5m", "30m", "1h"], index=0)
-    limit = st.slider("抓取K線根數（越多越穩，但越慢）", 200, 1500, 400, 50)
+    limit = st.slider("抓取K線根數", 200, 1500, 400, 50)
+
+    offline_json = ""
+    if mode == "離線：貼入 K 線 JSON":
+        offline_json = st.text_area(
+            "貼入 Binance K 線 JSON（你剛剛貼的那串 [[...],[...]]）",
+            height=220,
+        )
 
     st.subheader("均線參數")
     ma_fast = st.number_input("MA Fast", 1, 50, 7)
@@ -316,10 +312,10 @@ with st.sidebar:
 
     st.subheader("Telegram 通知")
     tg_on = st.toggle("啟用 Telegram 推播", value=False)
-    tg_token = st.text_input("BOT_TOKEN", type="password", help="從 @BotFather 取得")
-    tg_chat_id = st.text_input("CHAT_ID", help="用 getUpdates 找到 chat.id（群組多為負數）")
+    tg_token = st.text_input("BOT_TOKEN", type="password")
+    tg_chat_id = st.text_input("CHAT_ID")
     tg_send_on = st.selectbox("推播時機", ["只送 WARN/EXIT", "送所有狀態"], index=0)
-    tg_test = st.button("測試推播（送一則到 Telegram）")
+    tg_test = st.button("測試推播")
 
     st.divider()
     run = st.button("立即判定", type="primary")
@@ -347,8 +343,6 @@ params = {
 def maybe_send_telegram(symbol, interval, status, reasons, snap, *, force=False):
     if not params["TG_ON"]:
         return
-
-    # 測試訊息
     if force:
         ok, err = tg_send_message(params["TG_TOKEN"], params["TG_CHAT_ID"], f"✅ 測試成功：{symbol} 推播已啟用")
         if ok:
@@ -358,8 +352,6 @@ def maybe_send_telegram(symbol, interval, status, reasons, snap, *, force=False)
         return
 
     should_send = (params["TG_SEND_ON"] == "送所有狀態") or (status in ["WARN", "EXIT"])
-
-    # 防洗版：同幣種同週期，狀態變更才送
     key = f"last_status::{symbol}::{interval}"
     last_status = st.session_state.get(key)
 
@@ -377,7 +369,13 @@ if tg_test and params["TG_ON"]:
 
 if run:
     try:
-        ks = get_klines(symbol, interval, int(limit))
+        if mode == "線上抓 Binance Futures":
+            ks = get_klines_online(symbol, interval, int(limit))
+        else:
+            if not offline_json.strip():
+                raise RuntimeError("離線模式需要貼入 K 線 JSON。")
+            ks = json.loads(offline_json)
+
         df = parse_klines(ks)
         status, reasons, snap = evaluate_exit(df, params)
 
@@ -386,21 +384,20 @@ if run:
         with c1:
             st.subheader("判定結果（上一根已收K）")
             if status == "EXIT":
-                st.error("🟥 出場提醒：建議賣出/減碼（符合強出場條件）")
+                st.error("🟥 出場提醒：建議賣出/減碼")
             elif status == "WARN":
-                st.warning("⚠️ 警戒：建議移動停利/分批減碼（過熱或動能衰退）")
+                st.warning("⚠️ 警戒：建議移動停利/分批減碼")
             else:
                 st.success("✅ 持有：未觸發出場/警戒條件")
 
             st.markdown("**觸發原因：**")
-            for r in reasons:
-                st.write("• " + r)
+            for rr in reasons:
+                st.write("• " + rr)
 
         with c2:
             st.subheader("關鍵數值")
             st.json(snap)
 
-        # Telegram 推播（狀態變更才送）
         maybe_send_telegram(symbol, interval, status, reasons, snap)
 
         st.subheader("最近 80 根 K 線")
@@ -408,10 +405,5 @@ if run:
 
     except Exception as e:
         st.error(f"API/程式錯誤：{e}")
-        # 若你希望「API 斷線也推播」可把下面打開
-        # if params["TG_ON"]:
-        #     ok, err = tg_send_message(params["TG_TOKEN"], params["TG_CHAT_ID"], f"⚠️ {symbol} 抓資料失敗：{e}")
-        #     if not ok:
-        #         st.error(f"Telegram 斷線推播也失敗：{err}")
 else:
-    st.info("左側輸入合約代號（例：BTCUSDT），按「立即判定」。")
+    st.info("左側選擇模式：線上抓 Binance 或離線貼 JSON，按「立即判定」。")
