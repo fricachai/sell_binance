@@ -28,6 +28,7 @@ HEADERS = {
     "Accept": "application/json,text/plain,*/*",
 }
 
+
 def try_get_json(url: str, params=None, retries=2):
     last_err = ""
     for _ in range(retries + 1):
@@ -38,13 +39,13 @@ def try_get_json(url: str, params=None, retries=2):
         except Exception as e:
             last_err = str(e)
             time.sleep(0.6)
-            continue
     return None, last_err
+
 
 def get_klines_online(symbol: str, interval="15m", limit=300, retries=2):
     """
     不做 exchangeInfo：直接抓 klines
-    若 symbol 不存在，Binance 通常回 400/404，會被這裡顯示出來
+    若 symbol 不存在，Binance 通常回 400/404，會在錯誤訊息中顯示
     """
     last_err = ""
     for base in FAPI_BASES:
@@ -65,6 +66,7 @@ def get_klines_online(symbol: str, interval="15m", limit=300, retries=2):
         "B) 換網路出口（手機熱點/家用網路）\n"
         "C) 使用本頁『離線模式』貼入 K 線 JSON 照樣判定"
     )
+
 
 def parse_klines(ks):
     df = pd.DataFrame(
@@ -89,19 +91,19 @@ def parse_klines(ks):
     df["closeTime"] = pd.to_datetime(df["closeTime"].astype(np.int64), unit="ms")
     return df
 
+
 # -----------------------------
 # Indicators
 # -----------------------------
 def sma(x, n):
     return pd.Series(x).rolling(n).mean().to_numpy()
 
+
 def ema(x, n):
     return pd.Series(x).ewm(span=n, adjust=False).mean().to_numpy()
 
+
 def rsi(close, length=14):
- PARAMETERS = """
-        RSI (Wilder)
-    """
     c = pd.Series(close)
     delta = c.diff()
     gain = delta.clip(lower=0.0)
@@ -111,6 +113,7 @@ def rsi(close, length=14):
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return (100 - (100 / (1 + rs))).to_numpy()
 
+
 def macd(close, fast=12, slow=26, signal=9):
     efast = ema(close, fast)
     eslow = ema(close, slow)
@@ -119,6 +122,7 @@ def macd(close, fast=12, slow=26, signal=9):
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
+
 def atr(high, low, close, length=14):
     h = pd.Series(high)
     l = pd.Series(low)
@@ -126,6 +130,7 @@ def atr(high, low, close, length=14):
     prev_c = c.shift(1)
     tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / length, adjust=False).mean().to_numpy()
+
 
 # -----------------------------
 # Telegram
@@ -145,6 +150,7 @@ def tg_send_message(token: str, chat_id: str, text: str) -> tuple[bool, str]:
         return True, ""
     except Exception as e:
         return False, str(e)
+
 
 def format_alert(symbol: str, interval: str, status: str, reasons: list[str], snap: dict) -> str:
     status_txt = {"EXIT": "🟥 出場提醒", "WARN": "⚠️ 警戒提醒", "OK": "✅ 持有"}.get(status, status)
@@ -166,6 +172,7 @@ def format_alert(symbol: str, interval: str, status: str, reasons: list[str], sn
             extra += f"\nTrailStop: {snap.get('trail_stop'):.6f}"
 
     return f"{status_txt}\n標的: {symbol} ({interval})\n原因:\n{reason_txt}{extra}"
+
 
 # -----------------------------
 # Exit Logic
@@ -265,6 +272,7 @@ def evaluate_exit(df, p):
 
     return status, reasons, snap
 
+
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -283,7 +291,7 @@ with st.sidebar:
     offline_json = ""
     if mode == "離線：貼入 K 線 JSON":
         offline_json = st.text_area(
-            "貼入 Binance K 線 JSON（你剛剛貼的那串 [[...],[...]]）",
+            "貼入 Binance K 線 JSON（格式：[[...],[...]]）",
             height=220,
         )
 
@@ -340,6 +348,7 @@ params = {
     "TG_SEND_ON": tg_send_on,
 }
 
+
 def maybe_send_telegram(symbol, interval, status, reasons, snap, *, force=False):
     if not params["TG_ON"]:
         return
@@ -363,6 +372,7 @@ def maybe_send_telegram(symbol, interval, status, reasons, snap, *, force=False)
             st.session_state[key] = status
         else:
             st.error(f"Telegram 推播失敗：{err}")
+
 
 if tg_test and params["TG_ON"]:
     maybe_send_telegram(symbol, interval, "OK", ["(測試訊息)"], {}, force=True)
